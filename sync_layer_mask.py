@@ -10,19 +10,16 @@
 # アクティブレイヤをベースレイヤ(マスクが存在しない場合は不透明部分）と同じマスクにすることができる。
 # 兄弟レイヤやベースレイヤの関係性は、基本的にレイヤの名前から決定される.
 #
-# なお、sync-layergroup-maskについては若干挙動が異なり、
-# アクティブなものがレイヤグループであればそのグループ内のマスクを一番最初の子レイヤのもので統一。
-# アクティブなものがレイヤであれば、そのレイヤの所属するグループのマスクをそのレイヤのもので統一。
+# なお、sync-layergroup-maskについては若干挙動が異なり、「アルファ相続」「クリッピングレイヤー」
+# 的な挙動を行うためのものになっている。
+# 所属するレイヤグループの最下層のレイヤのアルファ値と、その他の兄弟レイヤのマスクを同期するというものだ。
+# 子グループについては「再帰して処理を行う」
+# トップレベルレイヤについてはこのsync-layergroup-maskは機能しない（常にではないが大抵の場合、
+# 最下層が完全に不完全なキャンバスな事が多く、まず機能せず混乱を招くだけという考え）
 #
-# 用語について：
-# 以下、このスクリプト独自の用語について解説する。
-# ベースレイヤとは、"hoge-base"というように、ハイフンbaseを末尾に付けたレイヤ
-# 兄弟レイヤとは、同一の基本名を持つレイヤ。
-# たとえば、"hoge-base","hoge-shadow","hoge-adjust"の基本名は"hoge"であり、これらは兄弟レイヤである。
-# "hoge-shadow"と"foo-base"、"bar-shadow"には、関係性が無い(ので、他のスクリプトで同期させる)。
-# 
 #[version]
 #0.1 初期リリース
+#0.2 グループの最下層レイヤーのアルファ値に同期させる（クリッピングレイヤー｜アルファ相続)関数を追加
 #[end]
 
 #  このプログラムはGPLライセンスver3で公開します。
@@ -40,7 +37,7 @@
 #   You may have received a copy of the GNU General Public License
 #   along with this program.  If not, see <http://www.gnu.org/licenses/>.           
 #
-#   Copyright (C) 2013 dothiko(http://dothiko.blog.fc2.com/) 
+#   Copyright (C) 2015 dothiko(http://dothiko.blog.fc2.com/) 
 
 
 from gimpfu import *
@@ -52,26 +49,12 @@ def python_fu_sync_layer_mask(a_img,a_drawable,src_layer,regexp_pattern):
     if src_layer==None:
         src_layer=a_img.active_layer
 
-    sync_layer_mask(a_img,re.compile(regexp_pattern),src_layer,None)
+    sync_layer_mask(a_img,src_layer,re.compile(regexp_pattern),None)
 
 def python_fu_sync_layer_mask_of_sibling(a_img,a_drawable):
     names=a_img.active_layer.name.split('-')
     head=names[0]
-    sync_layer_mask(a_img,re.compile(SIBLING_PATTERN % head),a_img.active_layer,None)
-
-def python_fu_sync_layer_mask_to_below(a_img,a_drawable,merge_mask):
-    al=a_img.active_layer
-    if al.parent:
-        plst=al.parent.children
-    else:
-        plst=a_img.layers
-
-    curidx=pdb.gimp_image_get_item_position(a_img,al)
-    
-    if curidx < len(plst):
-        sync_layer_mask(a_img,None,plst[curidx+1],(a_img.active_layer,),merge_mask)
-    else:
-        gimp.message("これより下にレイヤがありませんので、同期できません")
+    sync_layer_mask(a_img,a_img.active_layer,re.compile(SIBLING_PATTERN % head),None)
 
 def python_fu_sync_layer_mask_of_base(a_img,a_drawable):
 
@@ -93,23 +76,43 @@ def python_fu_sync_layer_mask_of_base(a_img,a_drawable):
     
     gimp.message("ベースレイヤ(%s-base)は発見できませんでした" % head)
 
-def python_fu_sync_layergroup_mask(a_img,a_drawable):
+def python_fu_sync_layergroup_mask(a_img,a_drawable,limit_to_linked,limit_to_has_mask,apply_prev_mask):
 
     cl=a_img.active_layer
     if len(cl.children)>0:
         # this is the layer group
         target_layers=cl.children
-        cl=cl.children[0] # topmost child used as unified mask source.
     elif cl.parent==None:
-        target_layers=a_img.layers
+        gimp.message("グループに所属するレイヤにのみ有効です")
+        return
     else:
         target_layers=cl.parent.children
 
-    sync_layer_mask(a_img,None,cl,targets=target_layers)
+    cl=target_layers[-1] # the last child used as unified mask source.
+    sync_layer_mask(a_img,None,cl,targets=target_layers,
+            limit_to_linked=limit_to_linked,
+            limit_to_has_mask=limit_to_has_mask,
+            apply_prev_mask=apply_prev_mask,
+            force_other_mask=True)
 
 
+def python_fu_sync_layer_mask_to_below(a_img,a_drawable,apply_prev_mask):
+    al=a_img.active_layer
+    if al.parent:
+        plst=al.parent.children
+    else:
+        plst=a_img.layers
 
-def sync_layer_mask(a_img,regexp,src_layer,targets,merge_mask=True):
+    curidx=pdb.gimp_image_get_item_position(a_img,al)
+    
+    if curidx < len(plst):
+        sync_layer_mask(a_img,None,plst[curidx+1],(a_img.active_layer,),apply_prev_mask=apply_prev_mask)
+    else:
+        gimp.message("これより下にレイヤがありませんので、同期できません")
+
+def sync_layer_mask(a_img,regexp,src_layer,targets,
+    limit_to_linked=False,limit_to_has_mask=False,
+    apply_prev_mask=False,force_other_mask=False):
     """
     core function.
 
@@ -138,34 +141,44 @@ def sync_layer_mask(a_img,regexp,src_layer,targets,merge_mask=True):
     pdb.gimp_image_undo_group_start(a_img)
 
     try:
-
         ax,ay=src_layer.offsets
 
         def do_sync(targets):
+        # Use this local function ,to recursive call does not needs copy flags.
             for cl in targets:
                 if cl!=src_layer:
+                    
                     if len(cl.children)>0:
                         # this is layer group.so, walk into layer group
-                        do_sync(cl.children)
+                        do_sync(cl.children) # RECURSIVE CALL
                     else:
 
                         if regexp:
                             mo=regexp.search(cl.name)
                         else:
-                            mo=True
+                            flag_limit_linked=True
+                            if limit_to_linked and not cl.linked:
+                                flag_limit_linked=False
+
+                            flag_limit_mask=True
+                            if limit_to_has_mask and cl.mask==None:
+                                flag_limit_mask=False
+
+                            mo=(flag_limit_linked and flag_limit_mask)
 
                         if mo:
                            #pdb.gimp_message("processing %s" % cl.name)
-                            if cl.mask!=None:
+                            if cl.mask==None:
+                                if force_other_mask:
+                                    new_mask=pdb.gimp_layer_create_mask(cl,1) # 1==Completely transparent mask,to composite it.
+                                else:
+                                    new_mask=pdb.gimp_layer_create_mask(cl,2) # 2==ADD ALPHA-COMPONENT MASK
+                            elif apply_prev_mask:
                                 pdb.gimp_layer_remove_mask(cl,0) # 0 means 'apply mask and delete it'
-
-                            if merge_mask:
-                                new_mask=pdb.gimp_layer_create_mask(cl,2) # 2==ADD ALPHA-COMPONENT MASK
-                            else:
                                 new_mask=pdb.gimp_layer_create_mask(cl,1) # completely transparent mask,to replace 
-                           #else:
-                           #    pdb.gimp_layer_remove_mask(cl,0) # 0 means 'apply mask and delete it'
-                           #    new_mask=pdb.gimp_layer_create_mask(cl,1) # completely transparent mask,to replace 
+                            else:
+                                pdb.gimp_layer_remove_mask(cl,1) # 1 means 'simply delete it without changing pixel.'
+                                new_mask=pdb.gimp_layer_create_mask(cl,1) # completely transparent mask,to replace 
 
                             pdb.gimp_layer_add_mask(cl,new_mask)
 
@@ -174,35 +187,9 @@ def sync_layer_mask(a_img,regexp,src_layer,targets,merge_mask=True):
 
                             pdb.gimp_layer_set_edit_mask(cl,0)
 
-
+        # Start processing here.
         do_sync(targets)
 
-       #for cl in targets:
-       #    if cl!=src_layer:
-       #        
-       #        if len(cl.children)>0:
-       #            # this is layer group.so, walk into layer group
-       #            sync_layer_mask(a_img,regexp,src_mask,cl.children)
-       #        else:
-       #
-       #            if regexp:
-       #                mo=regexp.search(cl.name)
-       #            else:
-       #                mo=True
-       #
-       #            if mo:
-       #               #pdb.gimp_message("processing %s" % cl.name)
-       #                if cl.mask==None:
-       #                    new_mask=pdb.gimp_layer_create_mask(cl,2) # 2==ADD ALPHA-COMPONENT MASK
-       #                else:
-       #                    pdb.gimp_layer_remove_mask(cl,0) # 0 means 'apply mask and delete it'
-       #                    new_mask=pdb.gimp_layer_create_mask(cl,1) # completely transparent mask,to replace 
-       #
-       #                pdb.gimp_layer_add_mask(cl,new_mask)
-       #
-       #                cx,cy=cl.offsets
-       #                pdb.gimp_channel_combine_masks(cl.mask, src_mask, 0, -cx+ax , -cy+ay) # mask composited.
-       #
     finally:
         # end of grouping undoable operations
         pdb.gimp_image_undo_group_end(a_img)
@@ -241,21 +228,6 @@ register(
         python_fu_sync_layer_mask_of_sibling)
 
 register(
-        "python_fu_sync_layer_mask_to_below",
-        "sync-layer-mask-to-below",
-        "真下のレイヤの不透明部分をマスクとして同期させる",
-        "dothiko",
-        "dothiko",
-        "apr 2015",
-        "<Image>/Python-Fu/mask/sync-layer-mask-to-below",
-        "RGB*,GRAY*",
-        [
-          (PF_BOOL,"merge_mask","現在の不透明領域(マスク)と合成",False),
-        ],
-        [],
-        python_fu_sync_layer_mask_to_below)
-
-register(
         "python_fu_sync_layer_mask_of_base",
         "sync-layer-mask-of-base",
         "アクティブレイヤのマスクを、ベースレイヤのマスクで同期する",
@@ -271,19 +243,35 @@ register(
 
 register(
         "python_fu_sync_layergroup_mask",
-        "sync-layergroup-mask",
-        "アクティブなレイヤで、所属するグループのマスクを統一する。",
+        "alpha-inherit-mask",
+        "アルファ相続的な動作で、グループの最後尾のアルファと各レイヤーのマスクを同期させる",
         "dothiko",
         "dothiko",
         "apr 2015",
         "<Image>/Python-Fu/mask/sync-layergroup-mask",
         "RGB*,GRAY*",
         [
+            (PF_BOOL,"limit_to_linked","リンクされたレイヤに限定",False),
+            (PF_BOOL,"limit_to_has_mask","現時点でマスクを持つレイヤに限定",True),
+            (PF_BOOL,"apply_prev_mask","対象レイヤが既にマスクを持つ場合、同期前にマスクを適用する",False),
         ],
         [],
         python_fu_sync_layergroup_mask)
 
-
+register(
+        "python_fu_sync_layer_mask_to_below",
+        "sync-layer-mask-to-below",
+        "真下のレイヤの不透明部分をマスクとして同期させる",
+        "dothiko",
+        "dothiko",
+        "apr 2015",
+        "<Image>/Python-Fu/mask/sync-layer-mask-to-below",
+        "RGB*,GRAY*",
+        [
+          (PF_BOOL,"apply_prev_mask","対象レイヤが既にマスクを持つ場合、同期前にマスクを適用する",False),
+        ],
+        [],
+        python_fu_sync_layer_mask_to_below)
 main()
 
 
